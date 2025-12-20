@@ -27,7 +27,7 @@ class StableVectorQuantizer(nn.Module):
         self.register_buffer('embed_avg', self.embeddings.weight.data.clone())
 
         # Training parameters
-        self.decay = 0.99
+        self.decay = 0.97
         self.eps = 1e-5
 
     def forward(self, inputs, mask=None):

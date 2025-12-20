@@ -20,12 +20,9 @@ def main():
 
     args = get_args(apply_optimizations=True)
 
-
-
     # Setup logging
     args = init_experiment('discrete-mbrl-full', args)
     print(args)
-
 
     # Setup GPU optimizations
     if torch.cuda.is_available():
