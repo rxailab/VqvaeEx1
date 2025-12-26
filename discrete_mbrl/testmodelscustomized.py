@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Simplified MiniGrid Model Debug Tool - WITH HEATMAP - FIXED FORMAT
++ Prints AE checkpoint / weights names used (best-effort via args + model metadata)
 """
 
 import sys
@@ -36,6 +37,86 @@ class ModelDebugGUI:
         self.setup_gui()
         self.reset_environment()
 
+    # ---------------------------
+    # NEW: checkpoint printing
+    # ---------------------------
+    def _looks_like_ckpt_key(self, k: str) -> bool:
+        k = k.lower()
+        return any(s in k for s in ["ckpt", "checkpoint", "resume", "pretrain", "weights", "model_path", "load", "path"])
+
+    def _looks_like_path(self, v) -> bool:
+        if not isinstance(v, str):
+            return False
+        v2 = v.lower()
+        return any(v2.endswith(ext) for ext in [".pt", ".pth", ".ckpt", ".bin"]) or ("/" in v2) or ("\\" in v2)
+
+    def _shorten_path(self, p: str, keep: int = 2) -> str:
+        """Return a shortened path for printing while still being informative."""
+        if not isinstance(p, str):
+            return str(p)
+        p = p.strip()
+        if len(p) == 0:
+            return p
+        parts = p.replace("\\", "/").split("/")
+        if len(parts) <= (2 * keep + 1):
+            return p
+        return "/".join(parts[:keep]) + "/.../" + "/".join(parts[-keep:])
+
+    def print_checkpoint_info(self):
+        """
+        Print any args fields that look like checkpoint paths,
+        and any model-attached ckpt metadata if available.
+        """
+        print("\n=== Checkpoint / Weights Info (best-effort) ===")
+
+        # 1) Print args.* that likely contain checkpoint paths
+        arg_items = sorted(vars(self.args).items(), key=lambda x: x[0])
+        hits = []
+        for k, v in arg_items:
+            if self._looks_like_ckpt_key(k) and (self._looks_like_path(v) or isinstance(v, (str, int, float, bool))):
+                hits.append((k, v))
+
+        if hits:
+            print("Args fields that look checkpoint-related:")
+            for k, v in hits:
+                if isinstance(v, str):
+                    print(f"  - args.{k} = {v}  (short: {self._shorten_path(v)})")
+                else:
+                    print(f"  - args.{k} = {v}")
+        else:
+            print("No obvious checkpoint-related fields found in args.")
+
+        # 2) Print possible model-attached checkpoint metadata (common attribute names)
+        for name, model in [
+            ("encoder/AE", getattr(self, "encoder", None)),
+            ("transition", getattr(self, "transition", None)),
+        ]:
+            if model is None:
+                continue
+
+            print(f"\nModel metadata hints for {name}:")
+            found_any = False
+            for attr in [
+                "ckpt_path",
+                "checkpoint_path",
+                "weights_path",
+                "load_path",
+                "_ckpt_path",
+                "_checkpoint_path",
+                "pretrained_path",
+            ]:
+                if hasattr(model, attr):
+                    val = getattr(model, attr)
+                    if isinstance(val, str):
+                        print(f"  - {attr} = {val}  (short: {self._shorten_path(val)})")
+                    else:
+                        print(f"  - {attr} = {val}")
+                    found_any = True
+            if not found_any:
+                print("  (no common ckpt-path attributes found)")
+
+        print("=== End Checkpoint Info ===\n")
+
     def setup_models(self):
         """Load encoder and transition models."""
         # Get observation shape
@@ -47,11 +128,16 @@ class ModelDebugGUI:
 
         # Load models
         self.encoder = construct_ae_model(obs.shape, self.args)[0].to(self.args.device).eval()
-        self.transition = construct_trans_model(self.encoder, self.args,
-                                                make_env(self.args.env_name).action_space)[0].to(
-            self.args.device).eval()
+        self.transition = construct_trans_model(
+            self.encoder,
+            self.args,
+            make_env(self.args.env_name).action_space
+        )[0].to(self.args.device).eval()
 
         print(f"✓ Models loaded: {type(self.encoder).__name__} + {type(self.transition).__name__}")
+
+        # NEW: print checkpoint names / paths used (best-effort)
+        self.print_checkpoint_info()
 
         # Get quantizer info for heatmap
         if hasattr(self.encoder, 'quantizer'):
@@ -78,8 +164,11 @@ class ModelDebugGUI:
         main.pack(fill='both', expand=True)
 
         # Title
-        ttk.Label(main, text=f"Model Debug: {self.args.ae_model_type} + {self.args.trans_model_type}",
-                  font=("Arial", 12, "bold")).pack(pady=(0, 10))
+        ttk.Label(
+            main,
+            text=f"Model Debug: {self.args.ae_model_type} + {self.args.trans_model_type}",
+            font=("Arial", 12, "bold")
+        ).pack(pady=(0, 10))
 
         # Images frame - now with 3 panels
         img_frame = ttk.Frame(main)
@@ -216,24 +305,36 @@ class ModelDebugGUI:
 
             # Create heatmap
             if self.has_quantizer:
-                im = self.ax.imshow(indices, cmap='tab20', vmin=0, vmax=self.codebook_size - 1,
-                                    interpolation='nearest', aspect='equal')
-                self.ax.set_title(f"Codebook Indices\n({indices.shape[0]}×{indices.shape[1]} grid)",
-                                  fontsize=10)
+                im = self.ax.imshow(
+                    indices,
+                    cmap='tab20',
+                    vmin=0,
+                    vmax=self.codebook_size - 1,
+                    interpolation='nearest',
+                    aspect='equal'
+                )
+                self.ax.set_title(
+                    f"Codebook Indices\n({indices.shape[0]}×{indices.shape[1]} grid)",
+                    fontsize=10
+                )
 
                 # Add text annotations for small grids
                 if indices.shape[0] <= 8 and indices.shape[1] <= 8:
                     for i in range(indices.shape[0]):
                         for j in range(indices.shape[1]):
-                            text = self.ax.text(j, i, str(indices[i, j]),
-                                                ha="center", va="center",
-                                                color="white" if indices[i, j] < self.codebook_size / 2 else "black",
-                                                fontsize=8, weight='bold')
+                            self.ax.text(
+                                j, i, str(indices[i, j]),
+                                ha="center", va="center",
+                                color="white" if indices[i, j] < self.codebook_size / 2 else "black",
+                                fontsize=8, weight='bold'
+                            )
             else:
                 # For non-quantized models, show normalized values
                 im = self.ax.imshow(indices, cmap='viridis', interpolation='nearest', aspect='equal')
-                self.ax.set_title(f"Encoded Values\n({indices.shape[0]}×{indices.shape[1]} grid)",
-                                  fontsize=10)
+                self.ax.set_title(
+                    f"Encoded Values\n({indices.shape[0]}×{indices.shape[1]} grid)",
+                    fontsize=10
+                )
 
             # Remove axes ticks for cleaner look
             self.ax.set_xticks([])
@@ -257,7 +358,7 @@ class ModelDebugGUI:
                         self.colorbar.remove()
                         cax = self.fig.add_axes([0.78, 0.1, 0.03, 0.8])
                         self.colorbar = self.fig.colorbar(im, cax=cax)
-                    except:
+                    except Exception:
                         pass
 
             # Update canvas without changing layout
@@ -457,19 +558,19 @@ class ModelDebugGUI:
         """Clean up and quit."""
         try:
             self.env.close()
-        except:
+        except Exception:
             pass
 
         # Clean up matplotlib resources
         try:
             if hasattr(self, 'colorbar') and self.colorbar is not None:
                 self.colorbar.remove()
-        except:
+        except Exception:
             pass
 
         try:
             plt.close(self.fig)  # Close matplotlib figure
-        except:
+        except Exception:
             pass
 
         self.root.quit()
