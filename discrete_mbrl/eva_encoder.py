@@ -1,340 +1,332 @@
 #!/usr/bin/env python3
 """
-Standalone AE/VQ-VAE encoder-decoder evaluation for MiniGrid using env.render() frames.
+Encoder Evaluation Script - Compatible with shared argument parser
+Evaluates and visualizes encoder reconstructions (robust to CHW/HWC + VQ index formats)
 
-Key fix:
-- MiniGrid obs["image"] is 7x7x3 (symbolic) -> too small for your conv AE
-- Use env.render() (rgb_array) and resize to a reasonable size (default 64x64)
-
-Repo-specific:
-- model_construction.py is in the same folder
-- construct_ae_model signature: construct_ae_model(input_dim, args, load=True, latent_activation=False)
-- make_ae_v1 expects input_dim as CHW tuple (C,H,W)
-- model_construction/training_helpers expect args.wandb/args.comet_ml/etc. -> patched defaults
+Key fixes vs your version:
+- Robust CHW/HWC detection in obs_to_numpy()
+- Robust VQ index extraction that handles tensors/tuples and multiple shapes
+- Uses encoder(obs_tensor) for reconstruction when possible (matches training forward)
 """
 
-import os
 import sys
-import argparse
-from typing import Any, Dict, Optional
-
+import os
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from PIL import Image
+from matplotlib.gridspec import GridSpec
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from env_helpers import make_env
+from model_construction import construct_ae_model
+from training_helpers import make_argparser, process_args
+from data_logging import init_experiment
 
 
-# --- Ensure local imports resolve from this folder (discrete_mbrl/) ---
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-if THIS_DIR not in sys.path:
-    sys.path.insert(0, THIS_DIR)
-
-
-def try_make_env(env_name: str, seed: int = 0):
-    """
-    Prefer project helper make_env; fallback to gymnasium.make(render_mode="rgb_array").
-    """
-    try:
-        from env_helpers import make_env  # type: ignore
-        env = make_env(env_name, seed=seed)
-        return env
-    except Exception:
-        import gymnasium as gym  # type: ignore
-        env = gym.make(env_name, render_mode="rgb_array")
-        try:
-            env.reset(seed=seed)
-        except TypeError:
-            pass
-        return env
-
-
-def ensure_args_fields(args: argparse.Namespace, defaults: Dict[str, Any]) -> argparse.Namespace:
-    for k, v in defaults.items():
-        if not hasattr(args, k):
-            setattr(args, k, v)
-    return args
-
-
-def patch_eval_defaults(args: argparse.Namespace) -> argparse.Namespace:
-    defaults = {
-        # tracking/logging toggles
-        "wandb": False,
-        "comet_ml": False,
-        "tensorboard": False,
-        "mlflow": False,
-
-        # saving/resume flags
-        "save": False,
-        "save_dir": "",
-        "log_dir": "",
-        "model_dir": "",
-        "results_dir": "",
-        "resume": False,
-        "resume_path": "",
-        "debug": False,
-
-        # experiment identity
-        "exp_name": "eval",
-        "run_name": "eval",
-        "project": "",
-        "group": "",
-        "tags": "",
-
-        # AE-specific
-        "ae_model_version": getattr(args, "ae_model_version", 1),
-        "ae_model_hash": "",
-        "ae_model_name": "",
-
-        # Trainer/optimizer defaults (constructor expects these)
-        "learning_rate": 1e-4,
-        "ae_grad_clip": 1.0,
-        "grad_clip": 1.0,
-        "weight_decay": 0.0,
-        "beta1": 0.9,
-        "beta2": 0.999,
-
-        # Often referenced batch/epochs even if unused here
-        "b": 32,
-        "batch_size": 32,
-        "epochs": 1,
-
-        "seed": getattr(args, "seed", 0),
-    }
-    return ensure_args_fields(args, defaults)
-
-
-
-def try_construct_ae(input_dim, args: argparse.Namespace) -> torch.nn.Module:
-    from model_construction import construct_ae_model  # local file
-    args = patch_eval_defaults(args)
-
-    out = construct_ae_model(input_dim, args, load=False)
-
-    # Many repos return (model, trainer) or (encoder, decoder, model, trainer).
-    if isinstance(out, torch.nn.Module):
-        return out
-
-    if isinstance(out, (tuple, list)):
-        # Prefer the first torch.nn.Module we can find
-        for item in out:
-            if isinstance(item, torch.nn.Module):
-                return item
-
-        # Or a dict-like tuple element
-        for item in out:
-            if isinstance(item, dict):
-                for v in item.values():
-                    if isinstance(v, torch.nn.Module):
-                        return v
-
-        raise RuntimeError(
-            f"construct_ae_model returned a tuple/list but no nn.Module found. "
-            f"Types: {[type(x) for x in out]}"
-        )
-
-    raise RuntimeError(f"Unexpected return type from construct_ae_model: {type(out)}")
-
-
-
-def load_checkpoint_into_model(model, ckpt_path, device, strict=True):
-    ckpt = torch.load(ckpt_path, map_location=device)
-    state_dict = None
-    if isinstance(ckpt, dict):
-        for k in ["state_dict", "model_state_dict", "model", "ae_state_dict", "net"]:
-            if k in ckpt and isinstance(ckpt[k], dict):
-                state_dict = ckpt[k]
-                break
-        if state_dict is None and all(isinstance(k, str) for k in ckpt.keys()):
-            state_dict = ckpt
+def preprocess_obs(obs):
+    """Convert observation to (1,C,H,W) float tensor in [0,1] if possible."""
+    if isinstance(obs, np.ndarray):
+        obs_t = torch.from_numpy(obs).float()
+    elif isinstance(obs, torch.Tensor):
+        obs_t = obs.float()
     else:
-        state_dict = ckpt
+        raise TypeError(f"Unsupported obs type: {type(obs)}")
 
-    cleaned = {}
-    for k, v in state_dict.items():
-        nk = k[7:] if isinstance(k, str) and k.startswith("module.") else k
-        cleaned[nk] = v
+    # Add batch dim
+    if obs_t.ndim == 3:
+        obs_t = obs_t.unsqueeze(0)
 
-    model.load_state_dict(cleaned, strict=strict)
+    # Try to ensure channel-first (B,C,H,W) if it looks like HWC
+    # Heuristic: if last dim is 1/3/4 and second dim isn't, assume BHWC -> BCHW
+    if obs_t.ndim == 4:
+        # obs_t shape could be (B,H,W,C) or (B,C,H,W)
+        if obs_t.shape[-1] in (1, 3, 4) and obs_t.shape[1] not in (1, 3, 4):
+            obs_t = obs_t.permute(0, 3, 1, 2).contiguous()
 
-def render_frame(env) -> np.ndarray:
-    """
-    Get an RGB frame (H,W,3) uint8 from env.render().
-    """
-    frame = env.render()
-    if frame is None:
-        raise RuntimeError(
-            "env.render() returned None. Ensure env was created with render_mode='rgb_array' "
-            "(fallback does this; your make_env might not)."
-        )
-    if not isinstance(frame, np.ndarray):
-        frame = np.array(frame)
-    if frame.ndim != 3 or frame.shape[2] != 3:
-        raise RuntimeError(f"Unexpected render frame shape: {frame.shape}")
-    if frame.dtype != np.uint8:
-        frame = frame.clip(0, 255).astype(np.uint8)
-    return frame
+    return obs_t
 
 
-def resize_hwc_uint8(img: np.ndarray, size: int) -> np.ndarray:
-    """
-    Resize HWC uint8 RGB to (size, size, 3).
-    Use NEAREST to keep grid-like style crisp.
-    """
-    pil = Image.fromarray(img)
-    pil = pil.resize((size, size), resample=Image.NEAREST)
-    out = np.array(pil, dtype=np.uint8)
-    return out
+def obs_to_numpy(obs):
+    """Convert observation/reconstruction to HWC numpy float in [0,1] for visualization."""
+    if isinstance(obs, torch.Tensor):
+        x = obs.detach().cpu().numpy()
+    else:
+        x = np.asarray(obs)
 
-
-def hwc_uint8_to_torch(img: np.ndarray, device: torch.device) -> torch.Tensor:
-    """
-    HWC uint8 -> torch float32 BCHW in [0,1]
-    """
-    x = torch.from_numpy(img).to(device=device)
-    x = x.float() / 255.0
-    x = x.permute(2, 0, 1).unsqueeze(0)  # 1,C,H,W
-    return x
-
-
-def torch_to_hwc_uint8(x: torch.Tensor) -> np.ndarray:
-    """
-    torch BCHW/CHW float -> HWC uint8
-    """
+    # Remove batch if present
     if x.ndim == 4:
         x = x[0]
-    x = x.detach().float().cpu()
 
-    # Some decoders output [-1,1] or other ranges; clamp to [0,1] best-effort
-    # If your recon looks too dark/bright, tell me and we’ll align normalization precisely.
-    x = x.clamp(0, 1)
+    # Now x is 3D or 2D
+    if x.ndim == 3:
+        # Detect CHW vs HWC deterministically
+        if x.shape[-1] in (1, 3, 4):
+            # already HWC
+            pass
+        elif x.shape[0] in (1, 3, 4):
+            # CHW -> HWC
+            x = np.transpose(x, (1, 2, 0))
+        else:
+            # ambiguous; default assume HWC
+            pass
 
-    x = x.permute(1, 2, 0).numpy()
-    x = (x * 255.0).round().clip(0, 255).astype(np.uint8)
+    x = np.clip(x, 0.0, 1.0)
+
+    # If grayscale 2D -> RGB
+    if x.ndim == 2:
+        x = np.stack([x] * 3, axis=-1)
+    elif x.ndim == 3 and x.shape[-1] == 1:
+        x = np.repeat(x, 3, axis=-1)
+
+    # If has alpha channel, drop it for display
+    if x.ndim == 3 and x.shape[-1] == 4:
+        x = x[..., :3]
+
     return x
 
 
-@torch.no_grad()
-def reconstruct(model: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+def extract_quantized_indices(encoder, obs_tensor):
     """
-    Handle common AE/VQ-VAE forward outputs.
+    Try hard to extract VQ code indices in a robust way.
+    Returns a 2D numpy int array if possible, else None.
+
+    Works for:
+    - encode() returning indices (LongTensor) shaped [B,L] or [B,H,W]
+    - encode() returning tuples/lists containing indices
+    - some implementations returning (z_q, indices, ...)
     """
-    model.eval()
-    out = model(x)
-    if isinstance(out, torch.Tensor):
-        return out
-    if isinstance(out, (tuple, list)) and len(out) > 0 and isinstance(out[0], torch.Tensor):
-        return out[0]
-    if isinstance(out, dict):
-        for key in ["recon", "reconstruction", "x_recon", "x_hat", "decoded"]:
-            if key in out and isinstance(out[key], torch.Tensor):
-                return out[key]
-    raise RuntimeError("Model forward output not recognized; adapt reconstruct() for your AE.")
+    if not hasattr(encoder, "quantizer"):
+        return None
 
+    with torch.no_grad():
+        enc = encoder.encode(obs_tensor)
 
-def make_grid(images: np.ndarray, ncols: int) -> np.ndarray:
-    """
-    images: (N,H,W,C)
-    """
-    N, H, W, C = images.shape
-    ncols = max(1, ncols)
-    nrows = int(np.ceil(N / ncols))
-    grid = np.zeros((nrows * H, ncols * W, C), dtype=np.uint8)
-    for i in range(N):
-        r, c = divmod(i, ncols)
-        grid[r * H:(r + 1) * H, c * W:(c + 1) * W, :] = images[i]
-    return grid
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--env_name", type=str, default="MiniGrid-SimpleCrossingS9N1-v0")
-    parser.add_argument("--ckpt", type=str, required=True)
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--steps", type=int, default=32)
-    parser.add_argument("--ncols", type=int, default=8)
-    parser.add_argument("--save_path", type=str, default="recon.png")
-    parser.add_argument("--show", action="store_true")
-
-    # IMPORTANT: render frame size to feed AE (match your AE training size)
-    parser.add_argument("--img_size", type=int, default=64, help="Resize env.render() frames to this square size")
-
-    # AE constructor args
-    parser.add_argument("--ae_model_type", type=str, default="vqvae")
-    parser.add_argument("--ae_model_version", type=int, default=1)
-    parser.add_argument("--codebook_size", type=int, default=512)
-    parser.add_argument("--embedding_dim", type=int, default=128)
-    parser.add_argument("--latent_dim", type=int, default=128)
-    parser.add_argument("--filter_size", type=int, default=9)
-
-    # compatibility flags (ignored in eval)
-    parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--comet_ml", action="store_true")
-
-    args = parser.parse_args()
-    args = patch_eval_defaults(args)
-
-    device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
-    print(f"[INFO] device={device}")
-
-    env = try_make_env(args.env_name, seed=args.seed)
-    obs, _ = env.reset(seed=args.seed) if hasattr(env, "reset") else (env.reset(), {})
-
-    # Build AE with CHW tuple matching resized render frames
-    input_dim = (3, args.img_size, args.img_size)
-    print(f"[INFO] using input_dim={input_dim} (CHW) from --img_size={args.img_size}")
-
-    ae = try_construct_ae(input_dim, args).to(device)
-    load_checkpoint_into_model(ae, args.ckpt, device)
-    ae.eval()
-    for p in ae.parameters():
-        p.requires_grad = False
-
-    originals, recons = [], []
-
-    for _ in range(args.steps):
-        frame = render_frame(env)                 # HWC, uint8
-        frame = resize_hwc_uint8(frame, args.img_size)
-        originals.append(frame)
-
-        x = hwc_uint8_to_torch(frame, device)     # BCHW float [0,1]
-        xhat = reconstruct(ae, x)
-        recon = torch_to_hwc_uint8(xhat)
-        recons.append(recon)
-
-        action = env.action_space.sample() if hasattr(env, "action_space") else 0
-        step_out = env.step(action)
-        if len(step_out) == 5:
-            obs, _, terminated, truncated, _ = step_out
-            done = terminated or truncated
+        # If encode returns (something, indices, ...)
+        idx = None
+        if isinstance(enc, (tuple, list)):
+            # Prefer LongTensor candidates
+            long_candidates = [
+                t for t in enc
+                if torch.is_tensor(t) and t.dtype in (torch.long, torch.int64)
+            ]
+            if len(long_candidates) > 0:
+                idx = long_candidates[0]
+            else:
+                # Fallback: first tensor element
+                for t in enc:
+                    if torch.is_tensor(t):
+                        idx = t
+                        break
         else:
-            obs, _, done, _ = step_out
+            idx = enc if torch.is_tensor(enc) else None
 
-        if done:
-            obs, _ = env.reset(seed=args.seed)
+        if idx is None or (not torch.is_tensor(idx)):
+            return None
 
-    originals = np.stack(originals, axis=0)
-    recons = np.stack(recons, axis=0)
+        idx0 = idx[0].detach().cpu()  # remove batch
 
-    orig_grid = make_grid(originals, ncols=args.ncols)
-    recon_grid = make_grid(recons, ncols=args.ncols)
+        # Already (H,W)
+        if idx0.ndim == 2:
+            return idx0.numpy().astype(int)
 
-    sep_h = 8
-    sep = np.ones((sep_h, orig_grid.shape[1], 3), dtype=np.uint8) * 255
-    combined = np.concatenate([orig_grid, sep, recon_grid], axis=0)
+        # Flattened (L,)
+        if idx0.ndim == 1:
+            L = idx0.numel()
+            side = int(np.sqrt(L))
+            if side * side == L:
+                return idx0.view(side, side).numpy().astype(int)
+            if L == 64:
+                return idx0.view(8, 8).numpy().astype(int)
+            # Can't safely reshape
+            return None
 
-    plt.figure(figsize=(max(8, args.ncols * 1.2), 10))
-    plt.imshow(combined)
-    plt.axis("off")
-    plt.title(f"Top: env.render() resized to {args.img_size} | Bottom: Reconstruction\nenv={args.env_name}")
-    plt.tight_layout()
-    plt.savefig(args.save_path, dpi=200)
-    print(f"[OK] Saved comparison image to: {args.save_path}")
+        # Sometimes comes as (H,W,?) or (C,H,W) etc — too ambiguous
+        return None
+
+
+def safe_forward_recon(encoder, obs_tensor):
+    """
+    Prefer encoder(obs_tensor) to match training forward.
+    Falls back to encode+decode if needed.
+    Returns recon tensor (B,C,H,W) on the same device as encoder.
+    """
+    with torch.no_grad():
+        try:
+            out = encoder(obs_tensor)
+            if isinstance(out, (tuple, list)):
+                recon = out[0]
+            else:
+                recon = out
+            if torch.is_tensor(recon):
+                return recon
+        except Exception:
+            pass
+
+        # Fallback
+        encoded = encoder.encode(obs_tensor)
+        recon = encoder.decode(encoded)
+        return recon
+
+
+def evaluate_encoder(args):
+    print(f"\n{'=' * 60}")
+    print("Encoder Evaluation")
+    print(f"{'=' * 60}")
+    print(f"Environment: {args.env_name}")
+    print(f"Model Type: {args.ae_model_type}")
+    print(f"Device: {args.device}")
+    print(f"{'=' * 60}\n")
+
+    env = make_env(args.env_name)
+
+    obs = env.reset()
+    if isinstance(obs, tuple):
+        obs = obs[0]
+
+    print(f"Raw observation shape: {np.array(obs).shape}")
+
+    print("Loading encoder from checkpoint...")
+    encoder = construct_ae_model(np.array(obs).shape, args)[0].to(args.device).eval()
+    print(f"✓ Encoder loaded: {type(encoder).__name__}")
+
+    if hasattr(encoder, "quantizer"):
+        n_emb = getattr(encoder, "n_embeddings", None)
+        if n_emb is not None:
+            print(f"✓ VQ-VAE detected with {n_emb} codebook entries")
+        else:
+            print("✓ VQ-VAE detected (quantizer present)")
+
+    print(f"\nCollecting {args.steps} environment samples...")
+    observations = []
+    reconstructions = []
+    indices_list = []
+
+    # Step through env and collect samples
+    for step in range(args.steps):
+        if step > 0:
+            action = env.action_space.sample()
+            step_result = env.step(action)
+            if len(step_result) == 4:
+                obs, _, done, _ = step_result
+            else:
+                obs, _, terminated, truncated, _ = step_result
+                done = terminated or truncated
+
+            if done:
+                obs = env.reset()
+                if isinstance(obs, tuple):
+                    obs = obs[0]
+
+        obs_tensor = preprocess_obs(np.array(obs)).to(args.device)
+
+        # Recon via forward (preferred)
+        recon = safe_forward_recon(encoder, obs_tensor)
+
+        observations.append(np.array(obs))
+        reconstructions.append(recon.detach().cpu().numpy()[0])
+
+        # VQ indices (if possible)
+        idx = extract_quantized_indices(encoder, obs_tensor)
+        if idx is not None:
+            indices_list.append(idx)
+
+    env.close()
+    print(f"✓ Collected {len(observations)} samples")
+
+    # Reconstruction error (display-space)
+    mse_errors = []
+    for orig, recon in zip(observations, reconstructions):
+        orig_np = obs_to_numpy(orig)
+        recon_np = obs_to_numpy(recon)
+        mse = float(np.mean((orig_np - recon_np) ** 2))
+        mse_errors.append(mse)
+
+    avg_mse = float(np.mean(mse_errors)) if len(mse_errors) > 0 else float("nan")
+    print(f"\nAverage MSE (display-space): {avg_mse:.6f}")
+
+    # Visualization
+    print("\nCreating visualization...")
+    n_display = min(args.ncols, len(observations))
+    show_indices = len(indices_list) > 0
+    n_rows = 3 if show_indices else 2
+
+    fig = plt.figure(figsize=(3 * n_display, 3 * n_rows))
+    gs = GridSpec(n_rows, n_display, figure=fig, hspace=0.25, wspace=0.15)
+
+    for i in range(n_display):
+        # Original
+        ax_orig = fig.add_subplot(gs[0, i])
+        ax_orig.imshow(obs_to_numpy(observations[i]))
+        ax_orig.set_title(f"Original {i + 1}")
+        ax_orig.axis("off")
+
+        # Reconstruction
+        ax_recon = fig.add_subplot(gs[1, i])
+        ax_recon.imshow(obs_to_numpy(reconstructions[i]))
+        ax_recon.set_title(f"Recon (MSE: {mse_errors[i]:.4f})")
+        ax_recon.axis("off")
+
+        # Indices (if available)
+        if show_indices:
+            ax_idx = fig.add_subplot(gs[2, i])
+            if i < len(indices_list):
+                im = ax_idx.imshow(indices_list[i], cmap="tab20", interpolation="nearest")
+                ax_idx.set_title("Indices")
+                ax_idx.axis("off")
+                if i == 0:
+                    plt.colorbar(im, ax=ax_idx, fraction=0.046, pad=0.04)
+            else:
+                ax_idx.set_title("Indices (N/A)")
+                ax_idx.axis("off")
+
+    plt.suptitle(
+        f"{args.ae_model_type} Evaluation - {args.env_name}\nAvg MSE: {avg_mse:.6f}",
+        fontsize=14,
+        fontweight="bold",
+        y=0.98,
+    )
+
+    if args.save_path:
+        plt.savefig(args.save_path, dpi=150, bbox_inches="tight")
+        print(f"✓ Saved to {args.save_path}")
 
     if args.show:
+        print("✓ Displaying visualization (close window to exit)")
         plt.show()
     else:
         plt.close()
+
+    print(f"\n{'=' * 60}")
+    print("Evaluation complete!")
+    print(f"{'=' * 60}\n")
+
+
+def main():
+    # Use shared argument parser (same as ModelDebugGUI)
+    parser = make_argparser()
+
+    # Add evaluation-specific arguments
+    parser.add_argument("--steps", type=int, default=10, help="Number of steps to sample")
+    parser.add_argument("--ncols", type=int, default=5, help="Number of columns in visualization")
+    parser.add_argument("--save_path", type=str, default=None, help="Path to save visualization")
+    parser.add_argument("--show", action="store_true", help="Show visualization window")
+
+    args = parser.parse_args()
+    args = process_args(args)
+
+    # Disable logging for evaluation
+    args.wandb = False
+    args.comet_ml = False
+    args = init_experiment("eval_encoder", args)
+
+    try:
+        evaluate_encoder(args)
+    except Exception as e:
+        print(f"\nError during evaluation: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
