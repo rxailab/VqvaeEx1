@@ -291,15 +291,14 @@ class ModelDebugGUI:
             return np.zeros((8, 8), dtype=int)
 
     def create_heatmap(self, indices):
-        """Create heatmap visualization of quantized indices."""
+        """Create heatmap visualization of quantized indices with overlaid text."""
         try:
-            # Don't clear the axes completely, just clear the image content
+            # Clear previous content
             for img in self.ax.get_images():
                 img.remove()
             for text in self.ax.texts:
                 text.remove()
 
-            # Ensure indices is not None and has proper shape
             if indices is None:
                 indices = np.zeros((8, 8), dtype=int)
 
@@ -318,42 +317,65 @@ class ModelDebugGUI:
                     fontsize=10
                 )
 
-                # Add text annotations for small grids
-                if indices.shape[0] <= 8 and indices.shape[1] <= 8:
-                    for i in range(indices.shape[0]):
-                        for j in range(indices.shape[1]):
+                # IMPROVED: Add text annotations with dynamic font sizing
+                h, w = indices.shape
+
+                # Calculate appropriate font size based on grid dimensions
+                # Larger grids get smaller fonts
+                base_fontsize = max(6, min(10, 80 // max(h, w)))
+
+                # Only show text for reasonable grid sizes (adjust threshold as needed)
+                if h <= 16 and w <= 16:  # Increased from 8x8 to 16x16
+                    for i in range(h):
+                        for j in range(w):
+                            idx_val = indices[i, j]
+
+                            # Better color contrast: use luminance calculation
+                            # Get the color from the colormap for this value
+                            norm_val = idx_val / (self.codebook_size - 1) if self.codebook_size > 1 else 0
+                            rgba = cm.get_cmap('tab20')(norm_val % 1.0)  # Wrap for tab20
+
+                            # Calculate luminance (perceived brightness)
+                            luminance = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
+                            text_color = "black" if luminance > 0.5 else "white"
+
                             self.ax.text(
-                                j, i, str(indices[i, j]),
+                                j, i, str(idx_val),
                                 ha="center", va="center",
-                                color="white" if indices[i, j] < self.codebook_size / 2 else "black",
-                                fontsize=8, weight='bold'
+                                color=text_color,
+                                fontsize=base_fontsize,
+                                weight='bold',
+                                # Add outline for better readability
+                                bbox=dict(
+                                    boxstyle='round,pad=0.1',
+                                    facecolor='none',
+                                    edgecolor='none',
+                                    alpha=0
+                                )
                             )
             else:
-                # For non-quantized models, show normalized values
+                # For non-quantized models
                 im = self.ax.imshow(indices, cmap='viridis', interpolation='nearest', aspect='equal')
                 self.ax.set_title(
                     f"Encoded Values\n({indices.shape[0]}×{indices.shape[1]} grid)",
                     fontsize=10
                 )
 
-            # Remove axes ticks for cleaner look
+            # Remove axes ticks
             self.ax.set_xticks([])
             self.ax.set_yticks([])
 
-            # Handle colorbar - create only once, then reuse
+            # Handle colorbar
             if self.colorbar is None:
                 try:
-                    # Create colorbar in fixed position
-                    cax = self.fig.add_axes([0.78, 0.1, 0.03, 0.8])  # [left, bottom, width, height]
+                    cax = self.fig.add_axes([0.78, 0.1, 0.03, 0.8])
                     self.colorbar = self.fig.colorbar(im, cax=cax)
                 except Exception as cb_error:
                     print(f"Colorbar creation error: {cb_error}")
             else:
-                # Update existing colorbar
                 try:
                     self.colorbar.update_normal(im)
-                except Exception as cb_error:
-                    # If update fails, recreate colorbar
+                except Exception:
                     try:
                         self.colorbar.remove()
                         cax = self.fig.add_axes([0.78, 0.1, 0.03, 0.8])
@@ -361,7 +383,6 @@ class ModelDebugGUI:
                     except Exception:
                         pass
 
-            # Update canvas without changing layout
             try:
                 self.heatmap_canvas.draw()
             except Exception as draw_error:
