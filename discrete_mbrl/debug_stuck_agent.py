@@ -285,7 +285,8 @@ def debug_forward_pass(checkpoint, encoder, env_name, device):
             print(f"\nAction probabilities:")
             print(f"  {probs}")
 
-            action = logits.argmax(dim=-1).item()
+            probs = torch.softmax(logits, dim=-1)
+            action = torch.multinomial(probs, 1).item()
             print(f"\nSelected action: {action}")
 
             # Check if always selecting same action
@@ -301,8 +302,9 @@ def debug_forward_pass(checkpoint, encoder, env_name, device):
                 obs_tensor = preprocess_obs([obs])
                 state = encoder.encode(obs_tensor.to(device), return_one_hot=True)
                 logits = policy(state)
+
                 probs = torch.softmax(logits, dim=-1)
-                action = logits.argmax(dim=-1).item()
+                action = torch.multinomial(probs, 1).item()
 
                 print(f"  Step {step + 1}: action={action}, probs={probs.cpu().numpy().round(3)}, reward={reward:.4f}")
 
