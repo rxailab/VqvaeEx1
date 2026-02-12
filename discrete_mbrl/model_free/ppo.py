@@ -165,7 +165,7 @@ class PPOTrainer():
           
         # Calculate new action probabilities and values for the epoch
         if self.e2e_loss:
-          minibatch['states'] = self.ae.encode(minibatch['obs'])
+            minibatch['states'] = self.ae.encode(minibatch['obs'], return_one_hot=True)
         new_values = self.critic(minibatch['states'])
         new_act_probs = F.softmax(self.policy(minibatch['states']), dim=-1)
         policy_entropy = Categorical(probs=new_act_probs).entropy()

@@ -38,6 +38,7 @@ def get_optimized_args(args):
         windows_multiprocessing_disabled = False
 
     # Data loading optimizations
+    '''
     if torch.cuda.is_available():
         gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3  # GB
 
@@ -51,7 +52,7 @@ def get_optimized_args(args):
         if gpu_memory >= 24:
             args.batch_size = max(args.batch_size, 6144)
             args.eval_batch_size = max(args.eval_batch_size, 1536)
-
+    '''
     # Only increase workers if NOT on Windows
     if not windows_multiprocessing_disabled:
         args.n_preload = max(args.n_preload, min(8, os.cpu_count()))
